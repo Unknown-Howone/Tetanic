@@ -4,72 +4,76 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"os"
-	"strings"
+	"time"
 )
 
 const (
-	SERVER_HOST = "localhost" // 服务器地址
-	SERVER_PORT = 8080        // 服务器端口
+	serverHost   = "localhost" // 服务器地址
+	serverPort   = 8080        // 服务器端口
+	clientNum    = 5           // 客户端数量
+	sendInterval = 30          // 发送间隔（秒）
 )
 
 func main() {
-	// 连接到服务器
-	serverAddr := fmt.Sprintf("%s:%d", SERVER_HOST, SERVER_PORT)
-	conn, err := net.Dial("tcp", serverAddr)
-	if err != nil {
-		fmt.Printf("连接服务器失败: %v\n", err)
-		return
-	}
-	defer conn.Close()
+	// 创建多个客户端
+	clients := make([]net.Conn, 0)
+	msgChans := make([]chan string, 0)
 
-	fmt.Println("已连接到服务器，请输入消息（输入 'quit' 退出）")
+	// 启动多个客户端
+	for i := 0; i < clientNum; i++ {
+		conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", serverHost, serverPort))
+		if err != nil {
+			fmt.Printf("客户端 %d 连接失败: %v\n", i+1, err)
+			continue
+		}
+		clients = append(clients, conn)
+		msgChan := make(chan string)
+		msgChans = append(msgChans, msgChan)
 
-	// 创建一个 channel 用于同步消息显示
-	msgChan := make(chan string)
-
-	// 启动一个 goroutine 用于接收服务器响应
-	go func() {
-		for {
-			// 读取服务器响应
-			response, err := bufio.NewReader(conn).ReadString('\n')
-			if err != nil {
-				fmt.Printf("读取服务器响应失败: %v\n", err)
-				return
+		// 启动接收消息的 goroutine
+		go func(clientNum int, conn net.Conn, msgChan chan string) {
+			reader := bufio.NewReader(conn)
+			for {
+				response, err := reader.ReadString('\n')
+				if err != nil {
+					fmt.Printf("客户端 %d 读取失败: %v\n", clientNum, err)
+					return
+				}
+				msgChan <- fmt.Sprintf("客户端 %d 收到: %s", clientNum, response)
 			}
-			msgChan <- response
-		}
-	}()
+		}(i+1, conn, msgChan)
 
-	// 主循环：读取用户输入并发送到服务器
-	reader := bufio.NewReader(os.Stdin)
+		// 启动发送消息的 goroutine
+		go func(clientNum int, conn net.Conn) {
+			ticker := time.NewTicker(time.Duration(sendInterval) * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					message := fmt.Sprintf("客户端 %d 的自动消息", clientNum)
+					_, err := conn.Write([]byte(message + "\n"))
+					if err != nil {
+						fmt.Printf("客户端 %d 发送失败: %v\n", clientNum, err)
+						return
+					}
+				}
+			}
+		}(i+1, conn)
+
+		fmt.Printf("客户端 %d 已连接到服务器 %s:%d\n", i+1, serverHost, serverPort)
+	}
+
+	// 主循环只负责显示消息
 	for {
-		// 读取用户输入
-		fmt.Print("请输入消息: ")
-		message, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Printf("读取输入失败: %v\n", err)
-			continue
+		// 显示所有客户端的消息
+		for _, msgChan := range msgChans {
+			select {
+			case msg := <-msgChan:
+				fmt.Println(msg)
+			default:
+			}
 		}
-
-		// 去除换行符
-		message = strings.TrimSpace(message)
-
-		// 检查是否退出
-		if message == "quit" {
-			fmt.Println("正在退出...")
-			return
-		}
-
-		// 发送消息到服务器
-		_, err = conn.Write([]byte(message + "\n"))
-		if err != nil {
-			fmt.Printf("发送消息失败: %v\n", err)
-			continue
-		}
-
-		// 等待并显示服务器响应
-		response := <-msgChan
-		fmt.Printf("服务器响应: %s\n", response)
+		time.Sleep(100 * time.Millisecond) // 避免CPU占用过高
 	}
 }

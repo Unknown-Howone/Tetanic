@@ -10,8 +10,16 @@ import (
 )
 
 const (
-	PORT = 8080 // 服务器端口
+	port        = 8080
+	maxReadSize = 1024
+	maxEvents   = 100 // 每次从 kqueue 获取事件的最大返回数量
+	numWorkers  = 100 // 工作 goroutine 的数量
 )
+
+// 定义任务结构
+type task struct {
+	fd int
+}
 
 func main() {
 	// 创建监听 socket
@@ -34,7 +42,7 @@ func main() {
 	}
 
 	// 绑定地址
-	addr := syscall.SockaddrInet4{Port: PORT}
+	addr := syscall.SockaddrInet4{Port: port}
 	copy(addr.Addr[:], net.ParseIP("0.0.0.0").To4())
 	err = syscall.Bind(listenFd, &addr)
 	if err != nil {
@@ -49,7 +57,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("服务器启动在端口 %d\n", PORT)
+	fmt.Printf("服务器启动在端口 %d\n", port)
 
 	// 创建 kqueue
 	kq, err := syscall.Kqueue()
@@ -63,23 +71,30 @@ func main() {
 		}
 	}()
 
-	// 将监听 socket 添加到 kqueue，监听新连接事件
-	listenEv := syscall.Kevent_t{
-		Ident:  uint64(listenFd),
-		Filter: syscall.EVFILT_READ, // 监听读事件（新连接）
-		Flags:  syscall.EV_ADD | syscall.EV_ENABLE,
-		Fflags: 0,
-		Data:   0,
-		Udata:  nil,
+	// 将监听 socket 添加到 kqueue
+	changes := []syscall.Kevent_t{
+		{
+			Ident:  uint64(listenFd),
+			Filter: syscall.EVFILT_READ,
+			Flags:  syscall.EV_ADD,
+		},
 	}
-	_, err = syscall.Kevent(kq, []syscall.Kevent_t{listenEv}, nil, nil)
+	_, err = syscall.Kevent(kq, changes, nil, nil)
 	if err != nil {
 		fmt.Printf("添加监听事件到 kqueue 失败: %v\n", err)
 		return
 	}
 
+	// 创建任务队列和 goroutine 池
+	taskChan := make(chan task, 10000) // 更大的任务队列
+
+	// 启动工作池
+	for i := 0; i < numWorkers; i++ {
+		go worker(kq, listenFd, taskChan)
+	}
+
 	// 事件循环
-	events := make([]syscall.Kevent_t, 100)
+	events := make([]syscall.Kevent_t, maxEvents)
 	for {
 		// 等待事件
 		n, err := syscall.Kevent(kq, nil, events, nil)
@@ -88,67 +103,128 @@ func main() {
 			continue
 		}
 
+		// 将事件分发给工作池
 		for i := 0; i < n; i++ {
-			ev := events[i]
-			if ev.Ident == uint64(listenFd) {
-				// 监听 socket 有事件，说明有新连接
-				clientFd, _, err := syscall.Accept(listenFd)
-				if err != nil {
-					fmt.Printf("接受连接失败: %v\n", err)
-					continue
-				}
+			fd := int(events[i].Ident)
+			taskChan <- task{fd: fd}
+		}
+	}
+}
 
-				// 将新连接的 socket 添加到 kqueue，监听其读写事件
-				clientEv := syscall.Kevent_t{
-					Ident:  uint64(clientFd),
-					Filter: syscall.EVFILT_READ, // 监听客户端 socket 的读事件
-					Flags:  syscall.EV_ADD | syscall.EV_ENABLE,
-					Fflags: 0,
-					Data:   0,
-					Udata:  nil,
-				}
-				_, err = syscall.Kevent(kq, []syscall.Kevent_t{clientEv}, nil, nil)
-				if err != nil {
-					fmt.Printf("添加客户端事件到 kqueue 失败: %v\n", err)
-					if err := syscall.Close(clientFd); err != nil {
-						fmt.Printf("关闭客户端 socket 失败: %v\n", err)
-					}
-					continue
-				}
+// 处理新连接
+func handleNewConnection(kq, listenFd int) {
+	clientFd, _, err := syscall.Accept(listenFd)
+	if err != nil {
+		fmt.Printf("接受连接失败: %v\n", err)
+		return
+	}
 
-				fmt.Printf("新客户端连接: %d\n", clientFd)
-			} else {
-				// 处理客户端 socket 的事件
-				clientFd := int(ev.Ident)
-				buf := make([]byte, 1024)
-				n, err := syscall.Read(clientFd, buf)
-				if err != nil {
-					if !errors.Is(err, syscall.EAGAIN) {
-						fmt.Printf("读取数据失败: %v\n", err)
-					}
-					continue
-				}
+	// 设置非阻塞模式
+	err = syscall.SetNonblock(clientFd, true)
+	if err != nil {
+		fmt.Printf("设置非阻塞模式失败: %v\n", err)
+		if err := syscall.Close(clientFd); err != nil {
+			fmt.Printf("关闭客户端 socket 失败: %v\n", err)
+		}
+		return
+	}
 
-				if n == 0 {
-					// 客户端关闭连接
-					if err := syscall.Close(clientFd); err != nil {
-						fmt.Printf("关闭客户端 socket 失败: %v\n", err)
-					}
-					fmt.Printf("客户端断开连接: %d\n", clientFd)
-					continue
-				}
+	// 将新连接的 socket 添加到 kqueue
+	changes := []syscall.Kevent_t{
+		{
+			Ident:  uint64(clientFd),
+			Filter: syscall.EVFILT_READ,
+			Flags:  syscall.EV_ADD,
+		},
+	}
+	if _, err := syscall.Kevent(kq, changes, nil, nil); err != nil {
+		fmt.Printf("添加客户端事件到 kqueue 失败: %v\n", err)
+		if err := syscall.Close(clientFd); err != nil {
+			fmt.Printf("关闭客户端 socket 失败: %v\n", err)
+		}
+		return
+	}
 
-				// 处理接收到的数据
-				message := string(buf[:n])
-				fmt.Printf("收到来自客户端 %d 的消息: %s\n", clientFd, message)
+	fmt.Printf("新客户端连接: %d\n", clientFd)
+}
 
-				// 发送响应
-				response := fmt.Sprintf("服务器已收到消息: %s", message)
-				_, err = syscall.Write(clientFd, []byte(response))
-				if err != nil {
-					fmt.Printf("发送响应失败: %v\n", err)
-				}
-			}
+// 读取客户端数据
+func readClientData(fd int) ([]byte, error) {
+	buf := make([]byte, maxReadSize)
+	n, err := syscall.Read(fd, buf)
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil // 客户端关闭连接
+	}
+	return buf[:n], nil
+}
+
+// 发送响应给客户端
+func sendResponse(fd int, message string) error {
+	response := fmt.Sprintf("服务器已收到消息: %s", message)
+	_, err := syscall.Write(fd, []byte(response))
+	return err
+}
+
+// 关闭客户端连接
+func closeClientConnection(kq, fd int) {
+	// 移除 kqueue 事件
+	changes := []syscall.Kevent_t{
+		{
+			Ident:  uint64(fd),
+			Filter: syscall.EVFILT_READ,
+			Flags:  syscall.EV_DELETE,
+		},
+	}
+	if _, err := syscall.Kevent(kq, changes, nil, nil); err != nil {
+		fmt.Printf("移除 kqueue 事件失败: %v\n", err)
+	}
+	// 关闭连接
+	if err := syscall.Close(fd); err != nil {
+		fmt.Printf("关闭客户端 socket 失败: %v\n", err)
+	}
+}
+
+// 处理客户端事件
+func handleClientEvent(kq, fd int) {
+	// 读取数据
+	data, err := readClientData(fd)
+	if err != nil {
+		if !errors.Is(err, syscall.EAGAIN) {
+			fmt.Printf("读取数据失败: %v\n", err)
+			closeClientConnection(kq, fd)
+		}
+		return
+	}
+
+	if data == nil {
+		// 客户端关闭连接
+		fmt.Printf("客户端断开连接: %d\n", fd)
+		closeClientConnection(kq, fd)
+		return
+	}
+
+	// 处理接收到的数据
+	message := string(data)
+	fmt.Printf("收到来自客户端 %d 的消息: %s\n", fd, message)
+
+	// 发送响应
+	if err = sendResponse(fd, message); err != nil {
+		fmt.Printf("发送响应失败: %v\n", err)
+		closeClientConnection(kq, fd)
+	}
+}
+
+// 工作池处理函数
+func worker(kq, listenFd int, taskChan chan task) {
+	for t := range taskChan {
+		fd := t.fd
+		if fd == listenFd {
+			handleNewConnection(kq, listenFd)
+		} else {
+			handleClientEvent(kq, fd)
 		}
 	}
 }
