@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build linux
 
 package main
 
@@ -51,46 +51,41 @@ func main() {
 
 	fmt.Printf("服务器启动在端口 %d\n", PORT)
 
-	// 创建 kqueue
-	kq, err := syscall.Kqueue()
+	// 创建 epoll
+	epfd, err := syscall.EpollCreate1(0)
 	if err != nil {
-		fmt.Printf("创建 kqueue 失败: %v\n", err)
+		fmt.Printf("创建 epoll 失败: %v\n", err)
 		return
 	}
 	defer func() {
-		if err := syscall.Close(kq); err != nil {
-			fmt.Printf("关闭 kqueue 失败: %v\n", err)
+		if err := syscall.Close(epfd); err != nil {
+			fmt.Printf("关闭 epoll 失败: %v\n", err)
 		}
 	}()
 
-	// 将监听 socket 添加到 kqueue，监听新连接事件
-	listenEv := syscall.Kevent_t{
-		Ident:  uint64(listenFd),
-		Filter: syscall.EVFILT_READ, // 监听读事件（新连接）
-		Flags:  syscall.EV_ADD | syscall.EV_ENABLE,
-		Fflags: 0,
-		Data:   0,
-		Udata:  nil,
+	// 将监听 socket 添加到 epoll
+	event := syscall.EpollEvent{
+		Events: syscall.EPOLLIN,
+		Fd:     int32(listenFd),
 	}
-	_, err = syscall.Kevent(kq, []syscall.Kevent_t{listenEv}, nil, nil)
+	err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, listenFd, &event)
 	if err != nil {
-		fmt.Printf("添加监听事件到 kqueue 失败: %v\n", err)
+		fmt.Printf("添加监听事件到 epoll 失败: %v\n", err)
 		return
 	}
 
 	// 事件循环
-	events := make([]syscall.Kevent_t, 100)
+	events := make([]syscall.EpollEvent, 100)
 	for {
 		// 等待事件
-		n, err := syscall.Kevent(kq, nil, events, nil)
+		n, err := syscall.EpollWait(epfd, events, -1)
 		if err != nil {
 			fmt.Printf("等待事件失败: %v\n", err)
 			continue
 		}
 
 		for i := 0; i < n; i++ {
-			ev := events[i]
-			if ev.Ident == uint64(listenFd) {
+			if int(events[i].Fd) == listenFd {
 				// 监听 socket 有事件，说明有新连接
 				clientFd, _, err := syscall.Accept(listenFd)
 				if err != nil {
@@ -98,18 +93,14 @@ func main() {
 					continue
 				}
 
-				// 将新连接的 socket 添加到 kqueue，监听其读写事件
-				clientEv := syscall.Kevent_t{
-					Ident:  uint64(clientFd),
-					Filter: syscall.EVFILT_READ, // 监听客户端 socket 的读事件
-					Flags:  syscall.EV_ADD | syscall.EV_ENABLE,
-					Fflags: 0,
-					Data:   0,
-					Udata:  nil,
+				// 将新连接的 socket 添加到 epoll
+				clientEvent := syscall.EpollEvent{
+					Events: syscall.EPOLLIN,
+					Fd:     int32(clientFd),
 				}
-				_, err = syscall.Kevent(kq, []syscall.Kevent_t{clientEv}, nil, nil)
+				err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, clientFd, &clientEvent)
 				if err != nil {
-					fmt.Printf("添加客户端事件到 kqueue 失败: %v\n", err)
+					fmt.Printf("添加客户端事件到 epoll 失败: %v\n", err)
 					if err := syscall.Close(clientFd); err != nil {
 						fmt.Printf("关闭客户端 socket 失败: %v\n", err)
 					}
@@ -119,7 +110,7 @@ func main() {
 				fmt.Printf("新客户端连接: %d\n", clientFd)
 			} else {
 				// 处理客户端 socket 的事件
-				clientFd := int(ev.Ident)
+				clientFd := int(events[i].Fd)
 				buf := make([]byte, 1024)
 				n, err := syscall.Read(clientFd, buf)
 				if err != nil {
